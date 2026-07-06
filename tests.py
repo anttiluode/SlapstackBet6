@@ -1,205 +1,102 @@
 #!/usr/bin/env python3
 """
-Open problem 3 — Stable Diffusion as an oracle node with BELIEF-weighted
-gradient masks (GPU; NOT executed in the build environment — smoke-test me).
-==========================================================================
+Bet 6 verification battery. CPU, ~1 min, no GPU or diffusion model needed.
 
-Bet 5b edited "which atoms receive gradients" with a hand-declared rectangle
-(hard 0/1 group mask). This script replaces the rectangle with the OUTPUT OF
-INFERENCE: soft per-atom weights w_i in [0, 1] exported from Bet 6 BP
-binding (bet6_open.export_belief_weights). The SDS gradient on every
-per-atom parameter is scaled by w_i, so:
+    python tests.py
 
-    w_i ~ 0   atom is confidently the protected object  -> untouchable
-    w_i ~ 1   atom is confidently background/other      -> fully editable
-    w_i ~ 0.5 the belief is genuinely unsure            -> half-strength
-              edits, exactly at the soft border of the ownership field
-
-This is the graphical-model division of labor made executable: BP knows
-WHAT IS WHERE and HOW SURE, SD knows WHAT THINGS LOOK LIKE. An edit is a
-conditioned inference, and the protection of the object is proportional to
-the belief that it is the object.
-
-Deployment shape (once repos are merged):
-  1. bet5 recon or sds run       ->  runs/<scene>/atoms.pt
-  2. bet6 bp_bind on those atoms ->  belief weights .npy (model index space)
-  3. this script                 ->  belief-masked SDS edit
-
-Example:
-  python bet6d_sds_oracle.py \
-      --init-atoms runs/recon_tractor/atoms.pt \
-      --weights runs/belief_weights_tractor.npy \
-      --prompt "a tractor on a beach in miami, ocean, sand, blue sky" \
-      --iters 1500 --render-size 512 --cfg 50 --no-camera \
-      --out runs/bet6d_beach_soft
-
-Honesty: the loop below is Bet 5's verified-on-GPU SDS loop; the only new
-mechanics are (a) loading float weights and (b) passing them where Bet 5
-passed a hard mask — bet5.apply_grad_masks already multiplies grads by a
-float tensor, so soft masking needs no new numerics. Still: first run is a
-smoke test. The known open risk from Bet 5 carries over (SD 2.1
-mode-seeking oversaturation).
+Covers: exact Sim(2) algebra (vote inversion, signature invariance,
+weighted fit), 6a binding + the BP-beats-signatures ablation, 6b
+calibration, 6c permanence through occlusion.
 """
-
-import argparse
-import json
 import math
-import os
-import random
-import time
 
 import numpy as np
-import torch
-import torch.nn.functional as F
 
-from bet5_gabor_sds import (load_atoms, resolve_frozen, make_optimizer,
-                            apply_grad_masks, sample_camera, save_png,
-                            geometry_fingerprint)
+from bet6_bp_binding import (make_template, transform_atoms, signature,
+                             pose_vote, fit_sim2, apply_pose,
+                             run_6a, run_6b, run_6c)
 
 
-def run(args):
-    from diffusers import StableDiffusionPipeline, DDPMScheduler
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device: {device}")
-    model = load_atoms(args.init_atoms)
-
-    w = np.load(args.weights).astype(np.float32)
-    assert len(w) == model.n_atoms, \
-        f"weights length {len(w)} != model atoms {model.n_atoms}"
-    assert 0.0 <= w.min() and w.max() <= 1.0, "weights must be in [0,1]"
-    mask = torch.from_numpy(w)
-    print(f"belief mask: {(w > 0.9).sum()} editable, {(w < 0.1).sum()} "
-          f"protected, {((w >= 0.1) & (w <= 0.9)).sum()} soft-border atoms")
-
-    dtype = torch.float16 if device.type == "cuda" else torch.float32
-    pipe = StableDiffusionPipeline.from_pretrained(
-        args.sd_model, torch_dtype=dtype, safety_checker=None,
-        requires_safety_checker=False)
-    pipe.to(device)
-    vae, unet, tok, te = pipe.vae, pipe.unet, pipe.tokenizer, pipe.text_encoder
-    for m in (vae, unet, te):
-        m.requires_grad_(False)
-    sched = DDPMScheduler.from_pretrained(args.sd_model, subfolder="scheduler")
-    alphas = sched.alphas_cumprod.to(device)
-    T = sched.config.num_train_timesteps
-
-    def embed(text):
-        ids = tok(text, padding="max_length", max_length=tok.model_max_length,
-                  truncation=True, return_tensors="pt").input_ids.to(device)
-        return te(ids)[0]
-
-    with torch.no_grad():
-        emb = torch.cat([embed(args.negative_prompt), embed(args.prompt)])
-
-    frozen = resolve_frozen(args.freeze)
-    opt = make_optimizer(model, frozen, "sds")
-    model.train().to(device)
-    fp0 = geometry_fingerprint(model)
-
-    os.makedirs(args.out, exist_ok=True)
-    log, t0 = [], time.time()
-    for it in range(args.iters):
-        opt.zero_grad()
-        cam = None if args.no_camera else sample_camera(args)
-        img = model.render(args.render_size, args.render_size, device,
-                           chunk=args.chunk, camera=cam)
-        x = img[None] * 2 - 1
-        if args.render_size != 512:
-            x = F.interpolate(x, (512, 512), mode="bilinear",
-                              align_corners=False)
-        latents = vae.encode(x.to(dtype)).latent_dist.sample() \
-            * vae.config.scaling_factor
-        latents = latents.float()
-
-        frac = it / max(1, args.iters - 1)
-        t_max = args.t_max_start + (args.t_max_end - args.t_max_start) * frac
-        t = torch.randint(int(args.t_min * T), int(t_max * T), (1,),
-                          device=device)
-        noise = torch.randn_like(latents)
-        noisy = sched.add_noise(latents, noise, t)
-        with torch.no_grad():
-            eps = unet(torch.cat([noisy] * 2).to(dtype), torch.cat([t] * 2),
-                       encoder_hidden_states=emb).sample.float()
-            eps_un, eps_tx = eps.chunk(2)
-            eps_hat = eps_un + args.cfg * (eps_tx - eps_un)
-        wgt = (1 - alphas[t]).view(-1, 1, 1, 1)
-        grad = (wgt * (eps_hat - noise)).detach()
-        sds_loss = (grad * latents).sum() / latents.numel()
-        loss = sds_loss + args.l0_weight * model.gates.l0().sum() / model.n_atoms
-        loss.backward()
-        if it < args.gate_warmup and model.gates.logits.grad is not None:
-            model.gates.logits.grad.zero_()
-        apply_grad_masks(model, mask, device)     # <-- soft belief mask
-        torch.nn.utils.clip_grad_norm_(
-            [p for g_ in opt.param_groups for p in g_["params"]], 1.0)
-        opt.step()
-
-        if it % max(1, args.iters // 30) == 0 or it == args.iters - 1:
-            row = {"it": it, "sds": float(sds_loss.item()), "t_max": t_max,
-                   **model.ledger()}
-            log.append(row)
-            print(f"[oracle] it {it:5d}  sds {sds_loss.item():+.4f}  "
-                  f"t_max {t_max:.2f}  ({time.time()-t0:.0f}s)")
-            with torch.no_grad():
-                save_png(model.render(args.render_size, args.render_size,
-                                      device, chunk=args.chunk,
-                                      hard_gates=True),
-                         os.path.join(args.out, f"it_{it:05d}.png"))
-
-    model.eval()
-    with torch.no_grad():
-        save_png(model.render(args.render_size, args.render_size, device,
-                              chunk=args.chunk, hard_gates=True),
-                 os.path.join(args.out, "final_hardgates.png"))
-    torch.save(model.state_dict(), os.path.join(args.out, "atoms.pt"))
-    fp1 = geometry_fingerprint(model)
-    ledger = {"mode": "sds_oracle", "prompt": args.prompt,
-              "weights": args.weights, "freeze": args.freeze,
-              "mask_stats": {"editable": int((w > 0.9).sum()),
-                             "protected": int((w < 0.1).sum()),
-                             "soft": int(((w >= 0.1) & (w <= 0.9)).sum())},
-              "geometry_fp_before": fp0, "geometry_fp_after": fp1,
-              "note": ("Whole-model fingerprint SHOULD change here (editable "
-                       "atoms train). Per-atom protection is enforced by the "
-                       "soft mask; verify visually that the protected object "
-                       "is intact."),
-              "final": model.ledger(), "log": log}
-    with open(os.path.join(args.out, "ledger.json"), "w") as fh:
-        json.dump(ledger, fh, indent=2)
-    print(f"done -> {args.out}")
+def test_pose_vote_inverts_action():
+    """pose_vote must exactly recover the pose that produced an observation."""
+    rng = np.random.default_rng(0)
+    tmpl = make_template(8, rng)
+    xi = np.array([0.3, -0.2, 0.35, 0.25])
+    obs = transform_atoms(tmpl, xi)
+    for i in range(8):
+        err = np.abs(pose_vote(obs[i], tmpl[i]) - xi).max()
+        assert err < 1e-9, f"vote error {err}"
+    print("PASS pose_vote: closed-form vote inverts the group action exactly")
 
 
-def main():
-    p = argparse.ArgumentParser(description="belief-weighted SDS oracle")
-    p.add_argument("--init-atoms", required=True)
-    p.add_argument("--weights", required=True,
-                   help=".npy soft weights in model index space, [0,1]")
-    p.add_argument("--out", default="runs/bet6d")
-    p.add_argument("--iters", type=int, default=1500)
-    p.add_argument("--render-size", type=int, default=512)
-    p.add_argument("--chunk", type=int, default=64)
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--l0-weight", type=float, default=5e-3)
-    p.add_argument("--gate-warmup", type=int, default=10 ** 9,
-                   help="default: gates never pruned during an edit")
-    p.add_argument("--freeze", default="gates")
-    p.add_argument("--no-camera", action="store_true")
-    p.add_argument("--cam-zoom", type=float, default=0.30)
-    p.add_argument("--cam-shift", type=float, default=0.25)
-    p.add_argument("--cam-rot", type=float, default=0.15)
-    p.add_argument("--prompt", required=True)
-    p.add_argument("--negative-prompt", default="blurry, low quality, deformed")
-    p.add_argument("--sd-model", default="sd2-community/stable-diffusion-2-1-base")
-    p.add_argument("--cfg", type=float, default=50.0)
-    p.add_argument("--t-min", type=float, default=0.02)
-    p.add_argument("--t-max-start", type=float, default=0.98)
-    p.add_argument("--t-max-end", type=float, default=0.50)
-    args = p.parse_args()
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    run(args)
+def test_signature_invariance():
+    """The fiber claim as a unit test: intrinsic signatures are untouched by
+    any Sim(2) pose. Identity cannot be moved by moving."""
+    rng = np.random.default_rng(1)
+    tmpl = make_template(10, rng)
+    for xi in ([0.5, -0.4, 0.4, 0.3], [-0.2, 0.1, -0.5, -0.25]):
+        d = np.abs(signature(transform_atoms(tmpl, np.array(xi)))
+                   - signature(tmpl)).max()
+        assert d < 1e-9, f"signature moved by pose: {d}"
+    print("PASS signature_invariance: pose cannot touch identity (err < 1e-9)")
+
+
+def test_fit_sim2():
+    rng = np.random.default_rng(2)
+    X = rng.normal(0, 0.4, (30, 2))
+    xi = np.array([0.15, -0.3, 0.5, 0.2])
+    Y = apply_pose(xi, X)
+    w = rng.uniform(0.2, 1.0, 30)
+    err = np.abs(fit_sim2(X, Y, w) - xi).max()
+    assert err < 1e-8, f"fit error {err}"
+    print(f"PASS fit_sim2: weighted Umeyama exact (err {err:.1e})")
+
+
+def test_6a_binding():
+    for s in range(3):
+        r = run_6a(seed=s, verbose=False)
+        assert r["accuracy"] == 1.0, f"seed {s}: acc {r['accuracy']}"
+        assert r["pose_err_max_abs"] < 0.05
+    print("PASS 6a: perfect binding + pose recovery over 3 seeds")
+
+
+def test_6a_bp_beats_signatures():
+    """BP pose consistency must add accuracy beyond the identity channel."""
+    so = np.mean([run_6a(seed=s, noise=0.03, iters=0, verbose=False)["accuracy"]
+                  for s in range(5)])
+    bp = np.mean([run_6a(seed=s, noise=0.03, iters=40, verbose=False)["accuracy"]
+                  for s in range(5)])
+    assert bp > so + 0.10, f"BP {bp:.3f} vs sig-only {so:.3f}"
+    print(f"PASS 6a ablation: BP {bp:.3f} > signature-only {so:.3f} at 3x noise")
+
+
+def test_6b_calibration():
+    r = run_6b(seed=0, verbose=False)
+    assert r["entropy_ambiguous_mean"] > 0.80, r
+    assert r["entropy_final"] < 0.15, r
+    assert r["acc_final"] == 1.0, r
+    assert r["ece"] < 0.15, r
+    print(f"PASS 6b: entropy {r['entropy_ambiguous_mean']:.2f} bits while "
+          f"evidence absent -> {r['entropy_final']:.2f} after; acc 1.0; "
+          f"ECE {r['ece']:.3f}")
+
+
+def test_6c_permanence():
+    r = run_6c(seed=0, verbose=False)
+    assert r["cov_growth_during_occlusion"] > 2.0, r
+    assert r["rebind_accuracy"] == 1.0, r
+    assert r["centroid_pred_err_at_emergence"] < 0.05, r
+    print(f"PASS 6c: covariance grew x{r['cov_growth_during_occlusion']:.1f} "
+          f"in the dark; predicted emergence within "
+          f"{r['centroid_pred_err_at_emergence']:.3f}; re-binding 1.0")
 
 
 if __name__ == "__main__":
-    main()
+    test_pose_vote_inverts_action()
+    test_signature_invariance()
+    test_fit_sim2()
+    test_6a_binding()
+    test_6a_bp_beats_signatures()
+    test_6b_calibration()
+    test_6c_permanence()
+    print("\nall tests pass")

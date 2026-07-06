@@ -1,564 +1,204 @@
 #!/usr/bin/env python3
 """
-BET 6 — Belief propagation object binding in Gabor packet space.
-=================================================================
+Open problem 3 — Stable Diffusion as an oracle node with BELIEF-weighted
+gradient masks (GPU; NOT executed in the build environment — smoke-test me).
+==========================================================================
 
-"objects that know what they know": objects are pose BELIEFS (Gaussians on
-the Lie algebra of Sim(2)) plus intrinsic templates; atoms carry categorical
-ASSIGNMENT beliefs. Binding, borders, and permanence are inference, not
-architecture. The BP posture is Tindall et al. (arXiv:2503.05693) with the
-physics removed: cheap local message passing as the engine, honesty about
-where the graph makes it lie (double counting on loops -> cavity messages).
+Bet 5b edited "which atoms receive gradients" with a hand-declared rectangle
+(hard 0/1 group mask). This script replaces the rectangle with the OUTPUT OF
+INFERENCE: soft per-atom weights w_i in [0, 1] exported from Bet 6 BP
+binding (bet6_open.export_belief_weights). The SDS gradient on every
+per-atom parameter is scaled by w_i, so:
 
-The Slapstack edge over capsules/GLOM-style routing-by-agreement: the
-part->whole pose vote is CLOSED-FORM GROUP ALGEBRA on atom parameters
-(verified exactly equivariant in Bet 5), not a learned transform. An atom's
-Sim(2)-invariant signature (cycles-per-envelope su*f, aspect su/sv,
-envelope-relative phase, color) identifies it; the group part poses it.
+    w_i ~ 0   atom is confidently the protected object  -> untouchable
+    w_i ~ 1   atom is confidently background/other      -> fully editable
+    w_i ~ 0.5 the belief is genuinely unsure            -> half-strength
+              edits, exactly at the soft border of the ownership field
 
-Experiments (all CPU, seconds each):
+This is the graphical-model division of labor made executable: BP knows
+WHAT IS WHERE and HOW SURE, SD knows WHAT THINGS LOOK LIKE. An edit is a
+conditioned inference, and the protection of the object is proportional to
+the belief that it is the object.
 
-  6a  STATIC BINDING.  K known templates hidden in a scene at unknown poses
-      with parameter noise and clutter atoms. Loopy BP over correspondence
-      beliefs b_i(k,j) and pose beliefs b(g_k). GO: assignments recovered,
-      poses recovered, clutter rejected to the outlier class.
+Deployment shape (once repos are merged):
+  1. bet5 recon or sds run       ->  runs/<scene>/atoms.pt
+  2. bet6 bp_bind on those atoms ->  belief weights .npy (model index space)
+  3. this script                 ->  belief-masked SDS edit
 
-  6b  COMMON FATE + CALIBRATION.  Two spatially interleaved atom clouds, no
-      templates, no appearance cues. Motions are IDENTICAL for the first
-      frames (evidence genuinely absent), then diverge. Online BP/EM from
-      motion alone. GO: binding accuracy high AFTER divergence, and belief
-      entropy is CALIBRATED: high during the ambiguous window, dropping
-      when evidence arrives; low expected calibration error (ECE).
+Example:
+  python bet6d_sds_oracle.py \
+      --init-atoms runs/recon_tractor/atoms.pt \
+      --weights runs/belief_weights_tractor.npy \
+      --prompt "a tractor on a beach in miami, ocean, sand, blue sky" \
+      --iters 1500 --render-size 512 --cfg 50 --no-camera \
+      --out runs/bet6d_beach_soft
 
-  6c  PERMANENCE BY INFERENCE.  Object A passes fully behind an occluder.
-      Its pose belief coasts on a constant-velocity prior with honestly
-      GROWING covariance, then re-binds its atoms on re-emergence. This is
-      the probabilistic upgrade of Bet 5: not "the tractor cannot move"
-      (frozen tensor) but "the system believes the tractor is still there,
-      and knows how well it knows".
-
-Usage:
-  python bet6_bp_binding.py --exp all --out runs/bet6
-  python tests.py            # assertion battery
+Honesty: the loop below is Bet 5's verified-on-GPU SDS loop; the only new
+mechanics are (a) loading float weights and (b) passing them where Bet 5
+passed a hard mask — bet5.apply_grad_masks already multiplies grads by a
+float tensor, so soft masking needs no new numerics. Still: first run is a
+smoke test. The known open risk from Bet 5 carries over (SD 2.1
+mode-seeking oversaturation).
 """
 
 import argparse
 import json
 import math
 import os
+import random
+import time
 
 import numpy as np
+import torch
+import torch.nn.functional as F
 
-# ----------------------------------------------------------------------------
-# Sim(2) utilities.  Pose xi = (tx, ty, rho, lam), action: x' = e^lam R(rho) x + t
-# Gaussian beliefs live in these coordinates (Euclidean approximation of the
-# Lie algebra — honest small-covariance approximation, noted in README).
-# ----------------------------------------------------------------------------
-
-def rot(rho):
-    c, s = math.cos(rho), math.sin(rho)
-    return np.array([[c, -s], [s, c]])
+from bet5_gabor_sds import (load_atoms, resolve_frozen, make_optimizer,
+                            apply_grad_masks, sample_camera, save_png,
+                            geometry_fingerprint)
 
 
-def apply_pose(xi, xy):
-    tx, ty, rho, lam = xi
-    return math.exp(lam) * xy @ rot(rho).T + np.array([tx, ty])
+def run(args):
+    from diffusers import StableDiffusionPipeline, DDPMScheduler
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"device: {device}")
+    model = load_atoms(args.init_atoms)
 
-def wrap_half_pi(d):
-    """Gabor orientation is pi-periodic (atom(theta+pi, phi) == atom(theta, -phi)),
-    so orientation differences are only defined mod pi. Wrap to [-pi/2, pi/2)."""
-    return (d + math.pi / 2) % math.pi - math.pi / 2
+    w = np.load(args.weights).astype(np.float32)
+    assert len(w) == model.n_atoms, \
+        f"weights length {len(w)} != model atoms {model.n_atoms}"
+    assert 0.0 <= w.min() and w.max() <= 1.0, "weights must be in [0,1]"
+    mask = torch.from_numpy(w)
+    print(f"belief mask: {(w > 0.9).sum()} editable, {(w < 0.1).sum()} "
+          f"protected, {((w >= 0.1) & (w <= 0.9)).sum()} soft-border atoms")
 
+    dtype = torch.float16 if device.type == "cuda" else torch.float32
+    pipe = StableDiffusionPipeline.from_pretrained(
+        args.sd_model, torch_dtype=dtype, safety_checker=None,
+        requires_safety_checker=False)
+    pipe.to(device)
+    vae, unet, tok, te = pipe.vae, pipe.unet, pipe.tokenizer, pipe.text_encoder
+    for m in (vae, unet, te):
+        m.requires_grad_(False)
+    sched = DDPMScheduler.from_pretrained(args.sd_model, subfolder="scheduler")
+    alphas = sched.alphas_cumprod.to(device)
+    T = sched.config.num_train_timesteps
 
-# ----------------------------------------------------------------------------
-# Atoms.  Structured array: xy(2), theta, su, sv, f, phase, color(3)
-# ----------------------------------------------------------------------------
+    def embed(text):
+        ids = tok(text, padding="max_length", max_length=tok.model_max_length,
+                  truncation=True, return_tensors="pt").input_ids.to(device)
+        return te(ids)[0]
 
-FIELDS = ["x", "y", "theta", "su", "sv", "f", "phase", "r", "g", "b"]
+    with torch.no_grad():
+        emb = torch.cat([embed(args.negative_prompt), embed(args.prompt)])
 
+    frozen = resolve_frozen(args.freeze)
+    opt = make_optimizer(model, frozen, "sds")
+    model.train().to(device)
+    fp0 = geometry_fingerprint(model)
 
-def make_template(n, rng):
-    """Random template with DISTINCT Sim(2)-invariant signatures per atom."""
-    a = np.zeros((n, len(FIELDS)))
-    a[:, 0:2] = rng.uniform(-0.35, 0.35, (n, 2))            # canonical xy
-    a[:, 2] = rng.uniform(-math.pi / 2, math.pi / 2, n)     # theta
-    a[:, 3] = rng.uniform(0.04, 0.12, n)                    # su
-    a[:, 4] = a[:, 3] * rng.uniform(0.4, 0.9, n)            # sv (aspect < 1)
-    a[:, 5] = rng.uniform(4.0, 14.0, n)                     # f
-    a[:, 6] = rng.uniform(0, 2 * math.pi, n)                # envelope-relative phase
-    a[:, 7:10] = rng.uniform(0, 1, (n, 3))                  # color
-    return a
-
-
-def transform_atoms(atoms, xi):
-    """Exact Sim(2) action on atom parameters (the Bet 5 algebra):
-    xy -> s R xy + t, theta -> theta + rho, sigma -> s sigma, f -> f/s.
-    Envelope-relative phase and color are INVARIANT."""
-    out = atoms.copy()
-    s = math.exp(xi[3])
-    out[:, 0:2] = apply_pose(xi, atoms[:, 0:2])
-    out[:, 2] = atoms[:, 2] + xi[2]
-    out[:, 3:5] = atoms[:, 3:5] * s
-    out[:, 5] = atoms[:, 5] / s
-    return out
-
-
-def signature(atoms):
-    """Sim(2)-invariant intrinsic signature: (log(su*f), log aspect,
-    cos/sin phase, color). Identity lives here; pose cannot touch it."""
-    return np.stack([
-        np.log(atoms[:, 3] * atoms[:, 5]),          # cycles per envelope width
-        np.log(atoms[:, 3] / atoms[:, 4]),          # aspect
-        np.cos(atoms[:, 6]), np.sin(atoms[:, 6]),   # phase (periodic-safe)
-        atoms[:, 7], atoms[:, 8], atoms[:, 9],      # color
-    ], axis=1)
-
-
-def pose_vote(obs, tmpl):
-    """CLOSED-FORM part->whole vote: the unique xi mapping template atom ->
-    observed atom. Scale from three independent scale-carrying channels
-    (su, sv, 1/f), rotation from theta (mod pi), translation from xy."""
-    s = (obs[3] / tmpl[3] * obs[4] / tmpl[4] * tmpl[5] / obs[5]) ** (1 / 3)
-    rho = wrap_half_pi(obs[2] - tmpl[2])
-    t = obs[0:2] - s * rot(rho) @ tmpl[0:2]
-    return np.array([t[0], t[1], rho, math.log(s)])
-
-
-# ----------------------------------------------------------------------------
-# Weighted Sim(2) fit (Umeyama) — closed-form M-step for motion binding
-# ----------------------------------------------------------------------------
-
-def fit_sim2(X, Y, w):
-    """argmin_{s,R,t} sum_i w_i ||Y_i - (s R X_i + t)||^2. Returns xi."""
-    w = w / (w.sum() + 1e-12)
-    mx, my = w @ X, w @ Y
-    Xc, Yc = X - mx, Y - my
-    C = (w[:, None] * Yc).T @ Xc
-    U, S, Vt = np.linalg.svd(C)
-    d = np.sign(np.linalg.det(U @ Vt))
-    D = np.diag([1.0, d])
-    Rm = U @ D @ Vt
-    var_x = (w @ (Xc ** 2).sum(1)) + 1e-12
-    s = np.trace(np.diag(S) @ D) / var_x
-    t = my - s * Rm @ mx
-    rho = math.atan2(Rm[1, 0], Rm[0, 0])
-    return np.array([t[0], t[1], rho, math.log(max(s, 1e-9))])
-
-
-# ----------------------------------------------------------------------------
-# Experiment 6a — static template binding via loopy BP with cavity messages
-# ----------------------------------------------------------------------------
-
-def run_6a(seed=0, K=3, n_per=12, n_clutter=10, noise=0.01, iters=40,
-           damping=0.5, cavity=True, out=None, verbose=True):
-    rng = np.random.default_rng(seed)
-    templates = [make_template(n_per, rng) for _ in range(K)]
-    true_xi = [np.array([rng.uniform(-0.5, 0.5), rng.uniform(-0.5, 0.5),
-                         rng.uniform(-0.5, 0.5), rng.uniform(-0.3, 0.3)])
-               for _ in range(K)]
-
-    obs_list, gt = [], []
-    for k in range(K):
-        o = transform_atoms(templates[k], true_xi[k])
-        o += rng.normal(0, noise, o.shape) * np.array(
-            [1, 1, 1, .3, .3, 20, 3, .5, .5, .5])   # per-field noise scaling
-        o[:, 3] = np.maximum(o[:, 3], 0.012)         # keep su, sv, f physical
-        o[:, 4] = np.maximum(o[:, 4], 0.008)
-        o[:, 5] = np.maximum(o[:, 5], 0.5)
-        obs_list.append(o)
-        gt += [k] * n_per
-    clutter = make_template(n_clutter, rng)
-    clutter[:, 0:2] = rng.uniform(-1, 1, (n_clutter, 2))
-    obs_list.append(clutter)
-    gt += [-1] * n_clutter
-    obs = np.vstack(obs_list)
-    gt = np.array(gt)
-    N = len(obs)
-
-    # correspondence candidates by invariant signature (identity channel)
-    sig_o = signature(obs)
-    sig_t = [signature(t) for t in templates]
-    SIG_VAR = 0.05
-    cands = []      # per atom: list of (k, j, sig_loglik)
-    for i in range(N):
-        c = []
-        for k in range(K):
-            d2 = ((sig_t[k] - sig_o[i]) ** 2).sum(1)
-            for j in np.argsort(d2)[:3]:
-                c.append((k, int(j), -0.5 * d2[j] / SIG_VAR))
-        cands.append(c)
-
-    OUT_LL = -12.0                              # outlier class log-likelihood
-    V = np.diag([0.03, 0.03, 0.05, 0.05]) ** 2  # pose-vote noise covariance
-    Vinv = np.linalg.inv(V)
-    P0inv = np.diag([1e-2] * 4)                 # broad pose prior precision
-
-    # beliefs: per atom, weights over candidates + outlier (last slot).
-    # Initialize from the IDENTITY channel (invariant signatures) — uniform
-    # init averages correct and incorrect pose votes into a garbage mean and
-    # loopy BP converges into the wrong basin (seed-dependent failures).
-    B = []
-    for i in range(N):
-        ll0 = np.array([sig_ll for (_, _, sig_ll) in cands[i]] + [OUT_LL])
-        b0 = np.exp(ll0 - ll0.max()); b0 /= b0.sum()
-        B.append(b0)
-    votes = [[pose_vote(obs[i], templates[k][j]) for (k, j, _) in cands[i]]
-             for i in range(N)]
-
-    mu = [np.zeros(4) for _ in range(K)]
-    for it in range(iters):
-        # ---- atom -> object: precision-weighted fusion of pose votes ----
-        Lam = [P0inv.copy() for _ in range(K)]
-        eta = [np.zeros(4) for _ in range(K)]
-        for i in range(N):
-            for c_idx, (k, j, _) in enumerate(cands[i]):
-                w = B[i][c_idx]
-                Lam[k] = Lam[k] + w * Vinv
-                eta[k] = eta[k] + w * (Vinv @ votes[i][c_idx])
-        Sig = [np.linalg.inv(L) for L in Lam]
-        mu = [Sig[k] @ eta[k] for k in range(K)]
-
-        # ---- object -> atom: likelihood under (cavity) pose belief ----
-        newB = []
-        for i in range(N):
-            ll = np.empty(len(cands[i]) + 1)
-            for c_idx, (k, j, sig_ll) in enumerate(cands[i]):
-                if cavity:  # remove atom i's own vote: no self-confirmation
-                    L_c = Lam[k] - B[i][c_idx] * Vinv
-                    e_c = eta[k] - B[i][c_idx] * (Vinv @ votes[i][c_idx])
-                    S_c = np.linalg.inv(L_c)
-                    m_c, S_k = S_c @ e_c, S_c
-                else:
-                    m_c, S_k = mu[k], Sig[k]
-                r = votes[i][c_idx] - m_c
-                Cov = S_k + V
-                ll[c_idx] = (sig_ll - 0.5 * r @ np.linalg.solve(Cov, r)
-                             - 0.5 * math.log(np.linalg.det(Cov)))
-            ll[-1] = OUT_LL
-            b = np.exp(ll - ll.max()); b /= b.sum()
-            newB.append(damping * b + (1 - damping) * B[i])
-        B = newB
-
-    # ---- read out ----
-    pred = np.empty(N, dtype=int)
-    conf = np.empty(N)
-    for i in range(N):
-        pk = np.zeros(K + 1)
-        for c_idx, (k, j, _) in enumerate(cands[i]):
-            pk[k] += B[i][c_idx]
-        pk[K] = B[i][-1]
-        pred[i] = np.argmax(pk) if np.argmax(pk) < K else -1
-        conf[i] = pk.max()
-    acc = (pred == gt).mean()
-    pose_err = float(np.mean([np.abs(mu[k] - true_xi[k]).max() for k in range(K)]))
-    res = {"exp": "6a", "seed": seed, "accuracy": float(acc),
-           "pose_err_max_abs": pose_err, "n_atoms": int(N),
-           "cavity": cavity,
-           "clutter_rejected": float((pred[gt == -1] == -1).mean())}
-    if verbose:
-        print(f"[6a seed {seed}] accuracy {acc:.3f}  pose_err {pose_err:.4f}  "
-              f"clutter_rejected {res['clutter_rejected']:.2f}")
-    if out:
-        plot_6a(obs, gt, pred, conf, mu, K, os.path.join(out, "6a_binding.png"))
-    return res
-
-
-# ----------------------------------------------------------------------------
-# Experiments 6b/6c — common-fate binding, calibration, occlusion permanence
-# ----------------------------------------------------------------------------
-
-def make_motion_world(seed=0, n_per=20, T=12, noise=0.006, ambiguous_until=6):
-    """Two spatially INTERLEAVED clouds. Identical motion until frame
-    `ambiguous_until` (evidence absent by construction), divergent after."""
-    rng = np.random.default_rng(seed)
-    ang = rng.uniform(0, 2 * math.pi, n_per)
-    A0 = np.stack([0.35 * np.cos(ang), 0.35 * np.sin(ang)], 1) \
-        + rng.normal(0, 0.05, (n_per, 2))
-    B0 = np.stack([0.25 * np.cos(ang), 0.25 * np.sin(ang)], 1) \
-        + rng.normal(0, 0.08, (n_per, 2))          # interleaved with A
-
-    def step_xi(t, obj):
-        if t < ambiguous_until or obj == "A":
-            return np.array([0.05, 0.0, 0.0, 0.0])          # common drift
-        return np.array([0.0, -0.05, 0.06, 0.0])            # B diverges
-
-    XA, XB = [A0], [B0]
-    for t in range(T - 1):
-        XA.append(apply_pose(step_xi(t, "A"), XA[-1]))
-        XB.append(apply_pose(step_xi(t, "B"), XB[-1]))
-    XA = np.array(XA) + rng.normal(0, noise, (T, n_per, 2))
-    XB = np.array(XB) + rng.normal(0, noise, (T, n_per, 2))
-    X = np.concatenate([XA, XB], axis=1)     # (T, 2n, 2), tracks persistent
-    gt = np.array([0] * n_per + [1] * n_per)
-    return X, gt, ambiguous_until
-
-
-def run_6b(seed=0, T=12, n_per=20, noise=0.006, n_anchor=3, em_iters=8,
-           out=None, verbose=True):
-    X, gt, amb = make_motion_world(seed, n_per, T, noise)
-    N = X.shape[1]
-    SIG2 = (2.5 * noise) ** 2 * 2       # residual variance, honestly inflated
-    EPS = 1e-3                          # uniform mixture floor (anti-hubris)
-
-    # anchors: n_anchor known atoms per object (a user click, in effect)
-    L = np.zeros((N, 2))                # cumulative log-likelihoods
-    anchor = np.full(N, -1)
-    anchor[:n_anchor] = 0
-    anchor[n_per:n_per + n_anchor] = 1
-
-    def beliefs():
-        b = np.exp(L - L.max(1, keepdims=True)); b /= b.sum(1, keepdims=True)
-        b = (1 - EPS) * b + EPS / 2
-        for i in range(N):
-            if anchor[i] >= 0:
-                b[i] = [1.0 - EPS, EPS] if anchor[i] == 0 else [EPS, 1.0 - EPS]
-        return b
-
-    ent_t, acc_t, snapshots = [], [], []
-    for t in range(T - 1):
-        for _ in range(em_iters):
-            b = beliefs()
-            xi = [fit_sim2(X[t], X[t + 1], b[:, k]) for k in range(2)]
-            step_ll = np.stack([
-                -((X[t + 1] - apply_pose(xi[k], X[t])) ** 2).sum(1) / (2 * SIG2)
-                for k in range(2)], axis=1)
-        L = L + step_ll                          # evidence accumulates
-        b = beliefs()
-        H = float(np.mean(-(b * np.log2(b)).sum(1)))
-        acc = float((b.argmax(1) == gt).mean())
-        ent_t.append(H); acc_t.append(acc)
-        snapshots.append((b.max(1).copy(), (b.argmax(1) == gt).copy()))
-        if verbose:
-            tag = "AMBIGUOUS" if t < amb - 1 else "divergent"
-            print(f"[6b t={t:2d} {tag:9s}] entropy {H:.3f} bits  acc {acc:.3f}")
-
-    # calibration over all (atom, time) snapshots
-    confs = np.concatenate([s[0] for s in snapshots])
-    corrs = np.concatenate([s[1] for s in snapshots])
-    bins = np.linspace(0.5, 1.0, 11)
-    ece, rel = 0.0, []
-    for lo, hi in zip(bins[:-1], bins[1:]):
-        m = (confs >= lo) & (confs < hi)
-        if m.sum() > 0:
-            ece += m.mean() * abs(corrs[m].mean() - confs[m].mean())
-            rel.append((float((lo + hi) / 2), float(corrs[m].mean()),
-                        int(m.sum())))
-    res = {"exp": "6b", "seed": seed,
-           "entropy_ambiguous_mean": float(np.mean(ent_t[:amb - 1])),
-           "entropy_final": float(ent_t[-1]),
-           "acc_final": float(acc_t[-1]), "ece": float(ece),
-           "reliability": rel}
-    if verbose:
-        print(f"[6b] H(ambiguous) {res['entropy_ambiguous_mean']:.3f} -> "
-              f"H(final) {res['entropy_final']:.3f} bits | "
-              f"acc {res['acc_final']:.3f} | ECE {ece:.3f}")
-    if out:
-        plot_6b(ent_t, acc_t, amb, rel, os.path.join(out, "6b_calibration.png"))
-        gif_6b(X, gt, T, seed, n_per, noise, os.path.join(out, "6b_binding.gif"))
-    return res
-
-
-def run_6c(seed=0, T=16, n_per=20, noise=0.006, occl=(5, 10), em_iters=8,
-           out=None, verbose=True):
-    """Object A fully occluded for frames occl[0]..occl[1]-1. Constant-velocity
-    coasting with growing covariance; re-binding on emergence."""
-    rng = np.random.default_rng(seed)
-    ang = rng.uniform(0, 2 * math.pi, n_per)
-    A0 = np.stack([0.3 * np.cos(ang) - 0.6, 0.3 * np.sin(ang)], 1)
-    B0 = rng.uniform(-0.25, 0.25, (n_per, 2)) + np.array([0.0, -0.7])
-    vA = np.array([0.09, 0.0, 0.0, 0.0])         # A crosses the scene
-    vB = np.array([0.0, 0.02, 0.0, 0.0])
-    XA, XB = [A0], [B0]
-    for t in range(T - 1):
-        XA.append(apply_pose(vA, XA[-1]))
-        XB.append(apply_pose(vB, XB[-1]))
-    XA = np.array(XA) + rng.normal(0, noise, (T, n_per, 2))
-    XB = np.array(XB) + rng.normal(0, noise, (T, n_per, 2))
-    visible_A = np.array([not (occl[0] <= t < occl[1]) for t in range(T)])
-
-    Q = np.diag([2e-4, 2e-4, 1e-4, 1e-4])        # process noise per frame
-    Rn = np.diag([1e-4] * 4)                     # fit-observation noise
-    xi_vel, P = np.zeros(4), np.diag([1e-2] * 4)   # A's velocity belief
-    cov_tr, pred_err = [], None
-    centroidA_pred = XA[occl[0] - 1].mean(0)
-
-    for t in range(T - 1):
-        if visible_A[t] and visible_A[t + 1]:
-            z = fit_sim2(XA[t], XA[t + 1], np.ones(n_per))   # observed step
-            S = P + Q + Rn
-            Kg = (P + Q) @ np.linalg.inv(S)
-            xi_vel = xi_vel + Kg @ (z - xi_vel)
-            P = (np.eye(4) - Kg) @ (P + Q)
-        else:
-            P = P + Q                                        # coast: honesty grows
-            centroidA_pred = apply_pose(xi_vel, centroidA_pred[None])[0]
-        cov_tr.append(float(np.trace(P)))
-
-    # re-emergence: predicted vs actual centroid, and re-binding accuracy
-    pred_err = float(np.linalg.norm(centroidA_pred - XA[occl[1]].mean(0)))
-    # associate re-appeared atoms: step-likelihood under A's coasted motion
-    # vs B's motion vs outlier, using the frame pair after emergence
-    t0 = occl[1]
-    zB = fit_sim2(XB[t0], XB[t0 + 1], np.ones(n_per))
-    SIG2 = (3 * noise) ** 2 * 2
-    allX0 = np.concatenate([XA[t0], XB[t0]])
-    allX1 = np.concatenate([XA[t0 + 1], XB[t0 + 1]])
-    llA = -((allX1 - apply_pose(xi_vel, allX0)) ** 2).sum(1) / (2 * SIG2)
-    llB = -((allX1 - apply_pose(zB, allX0)) ** 2).sum(1) / (2 * SIG2)
-    rebind = np.where(llA > llB, 0, 1)
-    gt = np.array([0] * n_per + [1] * n_per)
-    rebind_acc = float((rebind == gt).mean())
-
-    grow = cov_tr[occl[1] - 2] / cov_tr[occl[0] - 1]
-    res = {"exp": "6c", "seed": seed, "cov_growth_during_occlusion": float(grow),
-           "centroid_pred_err_at_emergence": pred_err,
-           "rebind_accuracy": rebind_acc, "occl_frames": list(occl)}
-    if verbose:
-        print(f"[6c] cov trace grew x{grow:.1f} during occlusion | "
-              f"centroid prediction error at emergence {pred_err:.4f} | "
-              f"re-binding accuracy {rebind_acc:.3f}")
-    if out:
-        plot_6c(cov_tr, occl, os.path.join(out, "6c_permanence.png"))
-    return res
-
-
-# ----------------------------------------------------------------------------
-# Plots
-# ----------------------------------------------------------------------------
-
-def plot_6a(obs, gt, pred, conf, mu, K, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    cols = ["#d43a2f", "#2f7ed4", "#3fae5a", "#999999"]
-    fig, ax = plt.subplots(1, 2, figsize=(9, 4.2))
-    for a, lab, lbl in ((ax[0], gt, "ground truth"), (ax[1], pred, "BP binding")):
-        for k in list(range(K)) + [-1]:
-            m = lab == k
-            a.scatter(obs[m, 0], obs[m, 1], s=28,
-                      c=cols[k if k >= 0 else -1],
-                      alpha=0.9 if k >= 0 else 0.45,
-                      label=f"obj {k}" if k >= 0 else "clutter")
-        a.set_title(lbl); a.set_aspect("equal"); a.set_xlim(-1.1, 1.1)
-        a.set_ylim(-1.1, 1.1)
-    for k in range(K):
-        ax[1].scatter(*mu[k][:2], marker="x", c="k", s=60)
-    ax[0].legend(fontsize=7, loc="upper left")
-    fig.suptitle("6a: template binding by pose-vote BP (x = inferred pose center)")
-    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
-
-
-def plot_6b(ent_t, acc_t, amb, rel, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(1, 2, figsize=(9, 3.6))
-    t = np.arange(len(ent_t))
-    ax[0].axvspan(-0.5, amb - 1.5, color="#f4d9a0", alpha=0.5,
-                  label="identical motion\n(evidence absent)")
-    ax[0].plot(t, ent_t, "o-", label="belief entropy (bits)")
-    ax[0].plot(t, acc_t, "s--", label="binding accuracy")
-    ax[0].set_xlabel("frame"); ax[0].set_ylim(-0.05, 1.05)
-    ax[0].legend(fontsize=7); ax[0].set_title("knowing what it knows")
-    if rel:
-        c, a, _ = zip(*rel)
-        ax[1].plot([0.5, 1], [0.5, 1], "k--", lw=1, label="perfect calibration")
-        ax[1].plot(c, a, "o-", label="observed")
-        ax[1].set_xlabel("confidence"); ax[1].set_ylabel("accuracy")
-        ax[1].legend(fontsize=7); ax[1].set_title("reliability")
-    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
-
-
-def gif_6b(X, gt, T, seed, n_per, noise, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    from PIL import Image
-    # rerun online BP capturing per-frame beliefs (cheap)
-    frames = []
-    res_frames = _replay_6b_beliefs(X, gt, n_per, noise)
-    for t, b in res_frames:
-        fig, ax = plt.subplots(figsize=(4.4, 4.4))
-        rgb = np.stack([b[:, 0], np.zeros(len(b)), b[:, 1]], 1)
-        ax.scatter(X[t][:, 0], X[t][:, 1], c=np.clip(rgb, 0, 1), s=45)
-        ax.set_xlim(-1.2, 1.6); ax.set_ylim(-1.6, 1.2)
-        ax.set_title(f"frame {t}: red=belief obj0, blue=obj1, purple=unsure")
-        ax.set_aspect("equal")
-        fig.canvas.draw()
-        buf = np.asarray(fig.canvas.buffer_rgba())[..., :3]
-        frames.append(Image.fromarray(buf.copy()))
-        plt.close(fig)
-    frames[0].save(path, save_all=True, append_images=frames[1:],
-                   duration=350, loop=0)
-
-
-def _replay_6b_beliefs(X, gt, n_per, noise, n_anchor=3, em_iters=8):
-    N = X.shape[1]; T = X.shape[0]
-    SIG2 = (2.5 * noise) ** 2 * 2; EPS = 1e-3
-    L = np.zeros((N, 2)); anchor = np.full(N, -1)
-    anchor[:n_anchor] = 0; anchor[n_per:n_per + n_anchor] = 1
-    outp = []
-
-    def beliefs():
-        b = np.exp(L - L.max(1, keepdims=True)); b /= b.sum(1, keepdims=True)
-        b = (1 - EPS) * b + EPS / 2
-        for i in range(N):
-            if anchor[i] >= 0:
-                b[i] = [1 - EPS, EPS] if anchor[i] == 0 else [EPS, 1 - EPS]
-        return b
-
-    for t in range(T - 1):
-        for _ in range(em_iters):
-            b = beliefs()
-            xi = [fit_sim2(X[t], X[t + 1], b[:, k]) for k in range(2)]
-            step_ll = np.stack([
-                -((X[t + 1] - apply_pose(xi[k], X[t])) ** 2).sum(1) / (2 * SIG2)
-                for k in range(2)], 1)
-        L = L + step_ll
-        outp.append((t + 1, beliefs()))
-    return outp
-
-
-def plot_6c(cov_tr, occl, path):
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(6, 3.4))
-    ax.axvspan(occl[0] - 1, occl[1] - 1, color="#cccccc", alpha=0.6,
-               label="occluded")
-    ax.semilogy(cov_tr, "o-")
-    ax.set_xlabel("frame"); ax.set_ylabel("tr(pose covariance)")
-    ax.set_title("6c: honesty grows in the dark, collapses on re-emergence")
-    ax.legend(fontsize=8)
-    fig.tight_layout(); fig.savefig(path, dpi=110); plt.close(fig)
-
-
-# ----------------------------------------------------------------------------
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--exp", default="all", choices=["all", "6a", "6b", "6c"])
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--trials", type=int, default=5, help="6a accuracy trials")
-    p.add_argument("--out", default="runs/bet6")
-    args = p.parse_args()
     os.makedirs(args.out, exist_ok=True)
-    ledger = []
-    if args.exp in ("all", "6a"):
-        accs = []
-        for s in range(args.trials):
-            r = run_6a(seed=args.seed + s, out=args.out if s == 0 else None)
-            accs.append(r["accuracy"]); ledger.append(r)
-        print(f"[6a] accuracy over {args.trials} seeds: "
-              f"{np.mean(accs):.3f} +/- {np.std(accs):.3f}")
-    if args.exp in ("all", "6b"):
-        ledger.append(run_6b(seed=args.seed, out=args.out))
-    if args.exp in ("all", "6c"):
-        ledger.append(run_6c(seed=args.seed, out=args.out))
+    log, t0 = [], time.time()
+    for it in range(args.iters):
+        opt.zero_grad()
+        cam = None if args.no_camera else sample_camera(args)
+        img = model.render(args.render_size, args.render_size, device,
+                           chunk=args.chunk, camera=cam)
+        x = img[None] * 2 - 1
+        if args.render_size != 512:
+            x = F.interpolate(x, (512, 512), mode="bilinear",
+                              align_corners=False)
+        latents = vae.encode(x.to(dtype)).latent_dist.sample() \
+            * vae.config.scaling_factor
+        latents = latents.float()
+
+        frac = it / max(1, args.iters - 1)
+        t_max = args.t_max_start + (args.t_max_end - args.t_max_start) * frac
+        t = torch.randint(int(args.t_min * T), int(t_max * T), (1,),
+                          device=device)
+        noise = torch.randn_like(latents)
+        noisy = sched.add_noise(latents, noise, t)
+        with torch.no_grad():
+            eps = unet(torch.cat([noisy] * 2).to(dtype), torch.cat([t] * 2),
+                       encoder_hidden_states=emb).sample.float()
+            eps_un, eps_tx = eps.chunk(2)
+            eps_hat = eps_un + args.cfg * (eps_tx - eps_un)
+        wgt = (1 - alphas[t]).view(-1, 1, 1, 1)
+        grad = (wgt * (eps_hat - noise)).detach()
+        sds_loss = (grad * latents).sum() / latents.numel()
+        loss = sds_loss + args.l0_weight * model.gates.l0().sum() / model.n_atoms
+        loss.backward()
+        if it < args.gate_warmup and model.gates.logits.grad is not None:
+            model.gates.logits.grad.zero_()
+        apply_grad_masks(model, mask, device)     # <-- soft belief mask
+        torch.nn.utils.clip_grad_norm_(
+            [p for g_ in opt.param_groups for p in g_["params"]], 1.0)
+        opt.step()
+
+        if it % max(1, args.iters // 30) == 0 or it == args.iters - 1:
+            row = {"it": it, "sds": float(sds_loss.item()), "t_max": t_max,
+                   **model.ledger()}
+            log.append(row)
+            print(f"[oracle] it {it:5d}  sds {sds_loss.item():+.4f}  "
+                  f"t_max {t_max:.2f}  ({time.time()-t0:.0f}s)")
+            with torch.no_grad():
+                save_png(model.render(args.render_size, args.render_size,
+                                      device, chunk=args.chunk,
+                                      hard_gates=True),
+                         os.path.join(args.out, f"it_{it:05d}.png"))
+
+    model.eval()
+    with torch.no_grad():
+        save_png(model.render(args.render_size, args.render_size, device,
+                              chunk=args.chunk, hard_gates=True),
+                 os.path.join(args.out, "final_hardgates.png"))
+    torch.save(model.state_dict(), os.path.join(args.out, "atoms.pt"))
+    fp1 = geometry_fingerprint(model)
+    ledger = {"mode": "sds_oracle", "prompt": args.prompt,
+              "weights": args.weights, "freeze": args.freeze,
+              "mask_stats": {"editable": int((w > 0.9).sum()),
+                             "protected": int((w < 0.1).sum()),
+                             "soft": int(((w >= 0.1) & (w <= 0.9)).sum())},
+              "geometry_fp_before": fp0, "geometry_fp_after": fp1,
+              "note": ("Whole-model fingerprint SHOULD change here (editable "
+                       "atoms train). Per-atom protection is enforced by the "
+                       "soft mask; verify visually that the protected object "
+                       "is intact."),
+              "final": model.ledger(), "log": log}
     with open(os.path.join(args.out, "ledger.json"), "w") as fh:
         json.dump(ledger, fh, indent=2)
     print(f"done -> {args.out}")
+
+
+def main():
+    p = argparse.ArgumentParser(description="belief-weighted SDS oracle")
+    p.add_argument("--init-atoms", required=True)
+    p.add_argument("--weights", required=True,
+                   help=".npy soft weights in model index space, [0,1]")
+    p.add_argument("--out", default="runs/bet6d")
+    p.add_argument("--iters", type=int, default=1500)
+    p.add_argument("--render-size", type=int, default=512)
+    p.add_argument("--chunk", type=int, default=64)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--l0-weight", type=float, default=5e-3)
+    p.add_argument("--gate-warmup", type=int, default=10 ** 9,
+                   help="default: gates never pruned during an edit")
+    p.add_argument("--freeze", default="gates")
+    p.add_argument("--no-camera", action="store_true")
+    p.add_argument("--cam-zoom", type=float, default=0.30)
+    p.add_argument("--cam-shift", type=float, default=0.25)
+    p.add_argument("--cam-rot", type=float, default=0.15)
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--negative-prompt", default="blurry, low quality, deformed")
+    p.add_argument("--sd-model", default="sd2-community/stable-diffusion-2-1-base")
+    p.add_argument("--cfg", type=float, default=50.0)
+    p.add_argument("--t-min", type=float, default=0.02)
+    p.add_argument("--t-max-start", type=float, default=0.98)
+    p.add_argument("--t-max-end", type=float, default=0.50)
+    args = p.parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    run(args)
 
 
 if __name__ == "__main__":

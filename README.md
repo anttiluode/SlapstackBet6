@@ -1,220 +1,212 @@
-#!/usr/bin/env python3
-"""
-Open problem 4 — the pi-ambiguity, and pose beliefs that can hold two minds.
-=============================================================================
+# SlapstackBet6 — Objects That Know What They Know
 
-The physics: a Gabor atom obeys  atom(theta + pi, phi) == atom(theta, -phi).
-Orientation alone is therefore only defined mod pi, which is why Bet 6's
-first cut wrapped rotation differences to [-pi/2, pi/2) and restricted test
-poses. But rotating a pose vote by pi FLIPS the translation estimate
-(R(rho+pi) = -R(rho)), so the ambiguity is not cosmetic — unresolved, it
-breaks binding for any rotation beyond +/- 90 degrees.
+> Belief propagation object binding in Gabor packet space: objects are pose
+> beliefs, borders are ownership marginals, permanence is inference.
 
-The fix is already in the representation: ENVELOPE-RELATIVE PHASE. The two
-hypotheses are distinguishable because the flip negates phase:
+Bets 4/5 (SlapstackBet5) proved generation and editing by construction:
+frozen tensors, boolean masks. This repo is the probabilistic upgrade — the
+"self-believing object network." An object is a pose belief on the Lie
+algebra of Sim(2) plus an intrinsic template; an atom carries a categorical
+belief about which object owns it. Binding is loopy BP; uncertainty is the
+honest, measurable state of the system.
 
-    H0:  rho = d_theta,        requires  phi_obs ==  phi_tmpl
-    H1:  rho = d_theta + pi,   requires  phi_obs == -phi_tmpl
+Method posture: Tindall et al., *Dynamics of disordered quantum systems
+with two- and three-dimensional tensor networks* (arXiv:2503.05693), physics
+removed — match the graph to the problem's geometry, use cheap local
+message passing as the engine, know where the graph makes it lie (double
+counting on loops → exact cavity messages: no atom confirms itself).
 
-Each correspondence therefore emits TWO pose votes, each scored by its
-phase consistency. Generic phases (away from 0 and pi, where phi == -phi)
-kill the wrong hypothesis outright — full SO(2) rotation recovery, exactly.
-Degenerate phases leave both hypotheses alive, and then the pose belief
-MUST be allowed to hold two modes. This module upgrades the object's pose
-belief from a single Gaussian to a mixture, initialized by density peaks in
-vote space and refined by EM.
+The Slapstack edge over capsule/GLOM-style routing-by-agreement: the
+part→whole vote is **closed-form group algebra**, not a learned transform.
 
-The satisfying part: a 180-degree-symmetric object with degenerate phases
-is GENUINELY pose-ambiguous — there is no fact of the matter mod pi — and
-the mixture should report two modes at ~equal weight. Calibrated ambiguity,
-the 6b story transported from assignment space to pose space. Breaking the
-symmetry with a single generic phase should collapse the mixture.
-"""
+```
+identity  = Sim(2)-invariant signature (su·f, su/sv, envelope-relative
+            phase, color)         <- pose cannot touch it (unit-tested)
+pose vote = the unique xi mapping template atom -> observed atom
+            <- inverts the group action exactly (unit-tested, err < 1e-9)
+```
 
-import math
+## Core results (first drop — all CPU, assertion-locked in `tests.py`)
 
-import numpy as np
+**6a — GO: static binding by pose-vote BP.** Three templates at unknown
+poses + clutter: accuracy 1.000 ± 0.000 over 10 seeds, pose recovered to
+~0.01, clutter rejected. Ablation: at 3× noise, identity channel alone
+0.77 → full BP 0.98. Pose consistency adds ~20 points at every noise level.
 
-from bet6_bp_binding import make_template, transform_atoms, signature, rot
+**6b — GO: common fate + calibrated ignorance.** Two spatially interleaved
+clouds, motion the only evidence, motions IDENTICAL for the first 5 frames.
+Entropy pinned at 0.85 bits exactly while evidence is absent, 0.047 bits
+after divergence, accuracy 1.0, ECE 0.082. "Knowing what it knows" is a
+number with a calibration score.
 
+**6c — GO: permanence by inference.** Object fully occluded for 5 frames:
+pose covariance grows ×3.8 in the dark, emergence predicted to 0.017,
+re-binding 1.000. Bet 5 was a tensor that *cannot* move; 6c is a belief
+that survives the absence of evidence and reports how much it degraded.
 
-def wrap_pi(d):
-    return (d + math.pi) % (2 * math.pi) - math.pi
+## Open-problem drop (second drop — `tests_open.py`, 6× PASS)
 
+### #4 SOLVED — the pi-ambiguity, and pose beliefs that hold two minds
+The physics: `atom(theta+pi, phi) == atom(theta, -phi)`, so orientation
+alone fixes rotation only mod pi — and `R(rho+pi) = -R(rho)` flips the
+translation vote, so unresolved this breaks binding beyond ±90°. The fix
+was in the representation all along: **envelope-relative phase**. Each
+correspondence now emits two hypothesis votes (rho vs rho+pi, phase vs
+−phase), each scored by phase consistency. Generic phases kill the wrong
+hypothesis outright:
 
-def pose_votes_2pi(obs, tmpl, sig_phase=0.35):
-    """Two pose-vote hypotheses per correspondence, each with its phase-
-    consistency log-likelihood. Resolves rotation mod 2*pi, not mod pi."""
-    s = (obs[3] / tmpl[3] * obs[4] / tmpl[4] * tmpl[5] / obs[5]) ** (1 / 3)
-    d_theta = obs[2] - tmpl[2]
-    out = []
-    for H in (0, 1):
-        rho = wrap_pi(d_theta + H * math.pi)
-        phi_expected = tmpl[6] if H == 0 else -tmpl[6]
-        dphi = wrap_pi(obs[6] - phi_expected)
-        pc = -0.5 * dphi ** 2 / sig_phase ** 2
-        t = obs[0:2] - s * rot(rho) @ tmpl[0:2]
-        out.append((np.array([t[0], t[1], rho, math.log(s)]), pc))
-    return out
+```
+full SO(2) recovery, exact (err < 1e-9), tested at rho = 2.5, -2.8, 1.9
+```
 
+Degenerate phases (phi ≈ 0) leave both alive — and then the pose belief is
+a **mixture** (density-peak init + EM + per-atom product-likelihood mode
+weights). The satisfying part, `bet6_multimodal.py`:
 
-def _wrap_to(ref_rho, xi):
-    """Re-express a vote's rho on the branch nearest a reference angle so
-    Gaussian algebra on the circle stays honest near a mode."""
-    out = xi.copy()
-    out[2] = ref_rho + wrap_pi(xi[2] - ref_rho)
-    return out
+```
+180°-symmetric object, phases 0:   modes 0.50 / 0.50 at rho and rho−pi
+same object, ONE generic phase:    modes 1.00 / 0.00 at the true rho
+```
 
+Genuine ambiguity is *held*, honestly, at 50/50 — there is no fact of the
+matter and the system says so. One phase-breaking atom collapses the
+posterior, because evidence multiplies across atoms (a build-time kill:
+EM's responsibility-mass weights under-react to a single decisive atom —
+mode weights must be Bayes factors, not vote counts).
 
-def _density_peaks(votes, weights, M, radius=0.45):
-    """Greedy mode-seeking init: pick the highest-weighted-density vote,
-    suppress its neighborhood (angle-aware distance), repeat."""
-    scale = np.array([0.15, 0.15, 0.30, 0.20])
-    V = np.array(votes)
-    W = np.array(weights)
-    dens = np.zeros(len(V))
-    for i in range(len(V)):
-        d = (V - V[i]) / scale
-        d[:, 2] = wrap_pi(V[:, 2] - V[i, 2]) / scale[2]
-        dens[i] = (W * np.exp(-0.5 * (d ** 2).sum(1))).sum()
-    peaks, alive = [], np.ones(len(V), bool)
-    for _ in range(M):
-        if not alive.any():
-            break
-        i = int(np.argmax(np.where(alive, dens, -np.inf)))
-        peaks.append(V[i].copy())
-        d = (V - V[i]) / scale
-        d[:, 2] = wrap_pi(V[:, 2] - V[i, 2]) / scale[2]
-        alive &= (d ** 2).sum(1) > radius ** 2 / scale.mean() ** 2 * 0  # keep simple:
-        alive &= np.sqrt(((V[:, :2] - V[i, :2]) ** 2).sum(1)) + \
-            np.abs(wrap_pi(V[:, 2] - V[i, 2])) > radius
-    return peaks
+### #1 SOLVED — real atoms as the template library
+`bet6_open.py` trains two actual Slapstack reconstructions (Bet 5 torch
+model, hard-concrete gates: a 92-atom tractor, a 91-atom star), extracts
+the surviving atoms, and hides both in a cluttered scene at rotations of
+**2.0 and −1.2 rad** — far beyond the old ±pi/2 wall, exercising the #4
+fix on real atoms with whatever signature collisions optimization left in:
 
+```
+accuracy 0.955   pose error 0.023   (15 clutter atoms, noise 0.006)
+```
 
-def mixture_bind(template, obs, M=2, iters=30, sig_var=0.05, out_ll=-14.0):
-    """Bind observed atoms to ONE template whose pose belief is a mixture of
-    M Gaussians on sim(2). Returns modes (weight, mu) sorted by weight, and
-    per-candidate responsibilities. EM over {correspondence, hypothesis,
-    mode}; the pose-vote noise V is fixed (same register as Bet 6 BP)."""
-    sig_t = signature(template)
-    sig_o = signature(obs)
-    V = np.diag([0.03, 0.03, 0.05, 0.05]) ** 2
-    Vinv = np.linalg.inv(V)
+### #2 SOLVED — borders as belief fields
+The border is not drawn; it is the decision boundary of the ownership field
+P(k|pixel) ∝ Σ_i b_i(k)·energy_i·envelope_i(pixel), computed through the
+atoms' actual Gabor envelopes (amplitude-weighted evidence: louder atoms
+claim harder). Quantified: mean pixel-ownership entropy **falls as evidence
+improves** —
 
-    cands, votes, base_ll = [], [], []
-    for i in range(len(obs)):
-        d2 = ((sig_t - sig_o[i]) ** 2).sum(1)
-        for j in np.argsort(d2)[:3]:
-            for (xi, pc) in pose_votes_2pi(obs[i], template[int(j)]):
-                cands.append((i, int(j)))
-                votes.append(xi)
-                base_ll.append(-0.5 * d2[int(j)] / sig_var + pc)
-    votes = np.array(votes)
-    base_ll = np.array(base_ll)
-    w0 = np.exp(base_ll - base_ll.max())
+```
+ownership entropy: 1.182 (clean scene)  <  1.326 (10x noisier scene)
+```
 
-    mus = _density_peaks(list(votes), w0, M)
-    M = len(mus)
-    pis = np.full(M, 1.0 / M)
+Figures in `runs/bet6_open/`: scene render | ownership field | entropy
+ridge (the border, glowing where beliefs are unsure). Honest note: absolute
+entropy stays well above zero because both reconstructions carry large
+coarse background envelopes that genuinely overlap across the canvas —
+mixed ownership there is the *correct* belief, not a failure. The claim is
+the contrast, and it is assertion-locked.
 
-    for _ in range(iters):
-        # E-step: responsibilities over modes x candidates (+outlier mass)
-        logr = np.empty((len(votes), M))
-        for m in range(M):
-            dv = votes - mus[m]
-            dv[:, 2] = wrap_pi(votes[:, 2] - mus[m][2])
-            Cov = V * 2
-            logr[:, m] = (math.log(pis[m] + 1e-12) + base_ll
-                          - 0.5 * np.einsum("ni,ij,nj->n", dv,
-                                            np.linalg.inv(Cov), dv))
-        lse = np.logaddexp.reduce(np.column_stack([logr, 
-                                                   np.full((len(votes), 1),
-                                                           out_ll)]), axis=1)
-        R = np.exp(logr - lse[:, None])          # (n_votes, M)
-        # one-vote-per-atom normalization: an atom cannot vote twice
-        atom_ids = np.array([c[0] for c in cands])
-        for i in np.unique(atom_ids):
-            m_i = atom_ids == i
-            tot = R[m_i].sum()
-            if tot > 1.0:
-                R[m_i] /= tot
-        # M-step
-        for m in range(M):
-            w = R[:, m]
-            if w.sum() < 1e-8:
-                continue
-            v_adj = np.array([_wrap_to(mus[m][2], v) for v in votes])
-            mus[m] = (w[:, None] * v_adj).sum(0) / w.sum()
-            mus[m][2] = wrap_pi(mus[m][2])
-        pis = R.sum(0) / max(R.sum(), 1e-12)
-        pis = pis / pis.sum()
+### #3 SHIPPED (GPU, untested) — SD as an oracle with belief masks
+`bet6d_sds_oracle.py` replaces Bet 5b's hand-declared rectangle with the
+output of inference: soft per-atom weights from BP
+(`bet6_open.export_belief_weights`, model index space, verified [0,1],
+0.95 of believed-object atoms protected). SDS gradients scale by w_i —
+protection proportional to the belief that an atom IS the object, with
+half-strength edits exactly at the soft border. The loop is Bet 5's
+GPU-verified SDS; the only new mechanics are float weights where a hard
+mask used to be (`apply_grad_masks` already multiplies by a float tensor).
+First run on your box is the smoke test.
 
-    # --- final mode weights: proper posterior, not responsibility mass ---
-    # EM's pi measures how many votes each mode explains, which under-reacts
-    # to a single decisive atom (evidence should MULTIPLY across atoms).
-    # Score each located mode by the product over atoms of that atom's best
-    # explanation under the mode (logsumexp over its candidates + outlier).
-    atom_ids = np.array([c[0] for c in cands])
-    post = np.zeros(M)
-    for m in range(M):
-        dv = votes - mus[m]
-        dv[:, 2] = wrap_pi(votes[:, 2] - mus[m][2])
-        Cov = V * 2
-        cll = base_ll - 0.5 * np.einsum("ni,ij,nj->n", dv,
-                                        np.linalg.inv(Cov), dv)
-        total = 0.0
-        for i in np.unique(atom_ids):
-            per_atom = np.append(cll[atom_ids == i], out_ll)
-            total += np.logaddexp.reduce(per_atom)
-        post[m] = total
-    post = np.exp(post - post.max())
-    post = post / post.sum()
+## Ledger
 
-    order = np.argsort(-post)
-    return [(float(post[m]), mus[m]) for m in order], (cands, votes, R)
+**Verified (CPU, this repo):**
+- Closed-form pose votes invert the Sim(2) action exactly; intrinsic
+  signatures bitwise pose-invariant (the fiber claim as a unit test).
+- 6a binding 1.000 ± 0.000 / clutter rejected / BP adds ~20 points over
+  the identity channel at all noise levels.
+- 6b: entropy 0.85 bits while evidence absent by construction → 0.05
+  after; acc 1.0; ECE 0.082.
+- 6c: covariance ×3.8 in the dark; emergence predicted to 0.017; perfect
+  re-binding.
+- #4: exact full-SO(2) pose recovery via phase-scored hypothesis pairs;
+  mixture pose beliefs hold genuine 50/50 ambiguity and collapse >0.95 on
+  one symmetry-breaking phase, across rotations and seeds.
+- #1: real recon atoms (92+91) bound at 0.955 among clutter at rotations
+  2.0 / −1.2 rad.
+- #2: border softness tracks belief uncertainty (entropy 1.182 vs 1.326,
+  clean vs noisy), through actual Gabor envelopes.
 
+**Killed (build-time, kept as warnings):**
+- "Uniform correspondence init is fine, BP will sort it out" — wrong
+  basin, seed-dependently. The identity channel must seed the pose channel.
+- "5× parameter noise is just harder" — it was NaNs from unphysical
+  negative sigma/f, silently poisoning fusion. Fields now clamped physical.
+- "EM mixture weights are the pose posterior" — they measure explained
+  vote mass and under-react to decisive single atoms (0.60/0.40 where the
+  truth was ~1/0). Mode weights are now per-atom product likelihoods
+  (Bayes factors). Evidence multiplies; votes don't.
 
-# ----------------------------------------------------------------------------
-# Stress worlds
-# ----------------------------------------------------------------------------
+**Open:**
+1. bet6d on real GPU: the beach edit with *inferred* borders (script
+   shipped, unexecuted).
+2. Closing the loop on real images: templates here are still placed
+   synthetically into scenes; the full pipeline is re-encoding a rendered/
+   photographed scene into atoms and binding those (needs the Bet 5 recon
+   as the scene encoder — semi-amortized, per Slapstack doctrine).
+3. Label-switching and damping schedules at larger K remain untuned
+   (partially mitigated: density-peak init + branch-aligned fusion).
+4. Multimodal beliefs currently upgrade the FUSION step; the full BP loop
+   in `bp_bind` is still unimodal-per-object (fine for phase-rich real
+   atoms, wrong for symmetric objects in clutter — merge is mechanical).
+5. The Entrain bridge (speculative, flagged): assignment consensus via
+   Stuart-Landau phase synchrony instead of categorical messages.
 
-def symmetric_template(n_half=5, seed=0, break_phase=None):
-    """180-degree-symmetric template: atom pairs at (x, theta) and (-x, theta)
-    with phase 0 (the degenerate value where phi == -phi). Rotating the
-    object by pi maps the atom set onto itself -> pose genuinely ambiguous
-    mod pi. `break_phase` gives ONE atom a generic phase, breaking it."""
-    rng = np.random.default_rng(seed)
-    half = make_template(n_half, rng)
-    half[:, 6] = 0.0                                  # degenerate phases
-    mirror = half.copy()
-    mirror[:, 0:2] *= -1                              # antipodal positions
-    tmpl = np.vstack([half, mirror])
-    if break_phase is not None:
-        tmpl[0, 6] = break_phase                      # one generic phase
-    return tmpl
+## Files
 
+```
+bet6_bp_binding.py    core: Sim(2) algebra, votes, weighted Umeyama,
+                      loopy BP with cavity messages, experiments 6a/6b/6c
+bet6_multimodal.py    #4: pose_votes_2pi (phase-scored hypothesis pairs),
+                      mixture pose beliefs, symmetry stress tests
+bet6_open.py          #1 + #2: real-atom template library (trains Bet 5
+                      recons on CPU), general bp_bind with 2pi votes,
+                      ownership fields + border figures, weight exporter
+bet6d_sds_oracle.py   #3: belief-weighted soft-mask SDS (GPU, untested)
+bet5_gabor_sds.py     vendored Bet 5 renderer/model (repo merge makes
+                      this the canonical copy)
+tests.py              first-drop battery  (7x PASS)
+tests_open.py         open-problem battery (6x PASS; first run trains the
+                      template cache, ~30 s)
+runs/                 figures + ledgers: 6a/6b/6c plots, border figures
+                      at two noise levels, belief_weights_tractor.npy
+```
 
-def run_symmetry_demo(rho_true=2.5, noise=0.004, seed=0, verbose=True):
-    rng = np.random.default_rng(seed)
-    xi_true = np.array([0.2, -0.15, rho_true, 0.1])
-    results = {}
-    for name, tmpl in (("symmetric", symmetric_template(seed=seed)),
-                       ("broken", symmetric_template(seed=seed,
-                                                     break_phase=1.3))):
-        obs = transform_atoms(tmpl, xi_true)
-        obs += rng.normal(0, noise, obs.shape) * np.array(
-            [1, 1, 1, .3, .3, 20, 3, .5, .5, .5])
-        obs[:, 3] = np.maximum(obs[:, 3], 0.012)
-        obs[:, 4] = np.maximum(obs[:, 4], 0.008)
-        obs[:, 5] = np.maximum(obs[:, 5], 0.5)
-        modes, _ = mixture_bind(tmpl, obs, M=2)
-        results[name] = modes
-        if verbose:
-            desc = ", ".join(f"pi={w:.2f} rho={mu[2]:+.3f}" for w, mu in modes)
-            print(f"[{name:9s}] modes: {desc}   (true rho {rho_true:+.3f}, "
-                  f"alias {wrap_pi(rho_true - math.pi):+.3f})")
-    return results, xi_true
+## Run
 
+```bash
+pip install numpy matplotlib pillow torch
+python tests.py            # 7x PASS
+python tests_open.py       # 6x PASS (first run ~90 s: trains templates)
+python bet6_bp_binding.py --exp all --out runs/bet6
+python bet6_open.py        # real atoms + borders + weight export
 
-if __name__ == "__main__":
-    run_symmetry_demo()
+# on the GPU box, after a bet5 scene exists:
+python bet6d_sds_oracle.py --init-atoms runs/recon_tractor/atoms.pt \
+    --weights runs/belief_weights_tractor.npy \
+    --prompt "a tractor on a beach in miami, ocean, sand, blue sky" \
+    --iters 1500 --render-size 512 --cfg 50 --no-camera \
+    --out runs/bet6d_beach_soft
+```
+
+## Honesty notes
+
+- Gaussian pose beliefs use Euclidean coordinates on the Lie algebra —
+  small-covariance approximation; mixture modes are branch-aligned on the
+  circle before fusion, which keeps the algebra honest near modes only.
+- 6b/6c assume persistent atom tracks (the representation's own claim,
+  assumed here, not demonstrated on real video).
+- The weight-export demo binds a model's own atoms back to themselves as a
+  shape check; the real deployment (scene model ⊃ template) is documented
+  in `bet6d_sds_oracle.py` and untested until the GPU run.
+- `bp_bind` remains unimodal per object (see Open #4-residual above).
+
+---
+*Slapstack lineage: hard-concrete gates, envelope-relative phase, honest
+ledgers. Do not hype. Do not lie. Just show.*
